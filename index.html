@@ -71,6 +71,9 @@ const monthKey=iso=>iso?String(iso).slice(0,7):"";
 const M_ES=["ene","feb","mar","abr","may","jun","jul","ago","sep","oct","nov","dic"];
 const monthLabel=mk=>{if(!mk)return "—";const[y,m]=mk.split("-");return `${M_ES[+m-1]} ${y.slice(2)}`;};
 const todayISO=()=>new Date().toISOString().slice(0,10);
+const usdOf=i=>(i.total_usd==null?0:Number(i.total_usd));
+const hasUsd=i=>i.total_usd!=null;
+const fmtUSD=v=>fmtMoney(v,"USD");
 
 /* ---------- normalización + parse del Excel ---------- */
 const _num=v=>{const n=Number(v);return isNaN(n)?0:Math.round(n*100)/100;};
@@ -102,6 +105,10 @@ function parseWorkbook(buf){
       importe:_num(row[5]),iva:_num(row[6]),total:_num(row[7]),fecha_emision:_toISO(row[11]),mes:_toISO(row[12]),
       fecha_vencimiento:_toISO(row[14]),estado:_est(row[15]),medio_pago:_medio(row[16]),fecha_pago:_toISO(row[20]),
       referencia:_str(row[21]).slice(0,40),comentarios:com};
+    const tcv=(typeof row[8]==="number"&&row[8]>0)?row[8]:null;
+    const colUsd=(typeof row[9]==="number"&&row[9]>0)?Math.round(row[9]*100)/100:null;
+    o.tc=tcv;
+    o.total_usd = o.moneda==="USD" ? o.total : (colUsd!=null ? colUsd : (tcv ? Math.round(o.total/tcv*100)/100 : null));
     o.clave=clave(o);out.push(o);
   }
   if(!out.length)throw new Error("La hoja no tiene filas con cliente.");
@@ -120,7 +127,7 @@ async function fetchAll(){
 async function fetchClaves(){
   let all=[],from=0;
   while(true){
-    const {data,error}=await sb.from("facturas").select("id,clave,estado").range(from,from+999);
+    const {data,error}=await sb.from("facturas").select("id,clave,estado,total_usd,tc").range(from,from+999);
     if(error)throw error;all=all.concat(data);if(data.length<1000)break;from+=1000;
   }
   return all;
@@ -131,20 +138,41 @@ async function importRows(rows){
   const nuevas=[],updates=[];
   for(const r of rows){
     const e=map.get(r.clave);
-    if(!e)nuevas.push(r);
-    else if(e.estado==="Pendiente"&&r.estado!=="Pendiente")updates.push({id:e.id,estado:r.estado,medio_pago:r.medio_pago,fecha_pago:r.fecha_pago});
+    if(!e){nuevas.push(r);continue;}
+    const patch={};
+    if(r.total_usd!=null&&Number(r.total_usd)!==Number(e.total_usd))patch.total_usd=r.total_usd;
+    if(r.tc!=null&&Number(r.tc)!==Number(e.tc))patch.tc=r.tc;
+    if(e.estado==="Pendiente"&&r.estado!=="Pendiente"){patch.estado=r.estado;patch.medio_pago=r.medio_pago;patch.fecha_pago=r.fecha_pago;}
+    if(Object.keys(patch).length)updates.push({id:e.id,patch});
   }
   for(let i=0;i<nuevas.length;i+=400){
     const {error}=await sb.from("facturas").upsert(nuevas.slice(i,i+400),{onConflict:"clave",ignoreDuplicates:true});
     if(error)throw error;
   }
   for(const u of updates){
-    const {error}=await sb.from("facturas").update({estado:u.estado,medio_pago:u.medio_pago,fecha_pago:u.fecha_pago}).eq("id",u.id);
+    const {error}=await sb.from("facturas").update(u.patch).eq("id",u.id);
     if(error)throw error;
   }
   return {nuevas:nuevas.length,actualizadas:updates.length};
 }
 async function updateInvoice(id,patch){const {error}=await sb.from("facturas").update(patch).eq("id",id);if(error)throw error;}
+async function fetchClientes(){const {data,error}=await sb.from("clientes").select("*").order("nombre");if(error)throw error;return data||[];}
+async function saveClienteDB(c){
+  const payload={nombre:c.nombre,contactos:c.contactos,notas:c.notas};
+  if(c.id){const {error}=await sb.from("clientes").update(payload).eq("id",c.id);if(error)throw error;}
+  else{const {error}=await sb.from("clientes").upsert(payload,{onConflict:"nombre"});if(error)throw error;}
+}
+async function deleteClienteDB(id){const {error}=await sb.from("clientes").delete().eq("id",id);if(error)throw error;}
+async function fetchCostos(){const {data,error}=await sb.from("costos").select("*").order("servicio");if(error)throw error;return data||[];}
+async function saveCostoDB(c){
+  const payload={concepto:c.concepto,servicio:c.servicio,monto:c.monto,moneda:c.moneda,notas:c.notas};
+  if(c.id){const {error}=await sb.from("costos").update(payload).eq("id",c.id);if(error)throw error;}
+  else{const {error}=await sb.from("costos").insert(payload);if(error)throw error;}
+}
+async function deleteCostoDB(id){const {error}=await sb.from("costos").delete().eq("id",id);if(error)throw error;}
+async function fetchConfig(){const {data,error}=await sb.from("config").select("*");if(error)throw error;const o={};(data||[]).forEach(r=>o[r.clave]=r.valor);return o;}
+async function saveConfigDB(clave,valor){const {error}=await sb.from("config").upsert({clave,valor},{onConflict:"clave"});if(error)throw error;}
+const deudaPorCliente=invoices=>{const m={};invoices.forEach(i=>{if(i.estado==="Pendiente"){const k=i.cliente.toLowerCase();m[k]=m[k]||{cliente:i.cliente,usd:0};m[k].usd+=usdOf(i);}});return m;};
 
 /* ---------- UI básica ---------- */
 function Badge({estado}){const s=EST_STYLE[estado]||EST_STYLE.Pendiente;return <span className="badge" style={{background:s.bg,color:s.fg}}>{estado}</span>;}
@@ -174,28 +202,27 @@ function CobrarModal({inv,onClose,onConfirm}){
 }
 
 /* ---------- Pendientes ---------- */
-function Pendientes({invoices,onMark}){
+function Pendientes({invoices,onMark,clientes,datosCobro}){
   const [groupBy,setGroupBy]=useState("cliente");
-  const [cur,setCur]=useState("Todas");
   const [q,setQ]=useState("");
   const [soloVenc,setSoloVenc]=useState(false);
   const [open,setOpen]=useState({});
   const [cobrar,setCobrar]=useState(null);
   const hoy=todayISO();
+  const cliMap=useMemo(()=>{const m={};(clientes||[]).forEach(c=>m[(c.nombre||"").toLowerCase()]=c);return m;},[clientes]);
   const pend=useMemo(()=>{const qq=q.trim().toLowerCase();return invoices.filter(i=>i.estado==="Pendiente"
-    &&(cur==="Todas"||i.moneda===cur)
     &&(!soloVenc||(i.fecha_vencimiento&&i.fecha_vencimiento<hoy))
-    &&(!qq||`${i.cliente} ${i.numeracion} ${i.referencia}`.toLowerCase().includes(qq)));},[invoices,cur,q,soloVenc]);
-  const totals=t=>CURRENCIES.filter(c=>t[c]).map(c=>fmtMoney(t[c],c)).join("  ·  ")||"—";
+    &&(!qq||`${i.cliente} ${i.numeracion} ${i.referencia}`.toLowerCase().includes(qq)));},[invoices,q,soloVenc]);
   const groups=useMemo(()=>{const m={};pend.forEach(i=>{const k=groupBy==="cliente"?i.cliente:monthKey(i.mes||i.fecha_emision);
-    m[k]=m[k]||{key:k,items:[],totals:{},venc:0};m[k].items.push(i);
+    m[k]=m[k]||{key:k,items:[],usd:0,venc:0};m[k].items.push(i);
     if(i.fecha_vencimiento&&i.fecha_vencimiento<hoy)m[k].venc++;
-    m[k].totals[i.moneda]=(m[k].totals[i.moneda]||0)+i.total;});
+    m[k].usd+=usdOf(i);});
     const a=Object.values(m);a.forEach(g=>g.items.sort((x,y)=>(y.mes||"").localeCompare(x.mes||"")));
     if(groupBy==="mes")a.sort((x,y)=>y.key.localeCompare(x.key));
-    else a.sort((x,y)=>Object.values(y.totals).reduce((s,v)=>s+Math.abs(v),0)-Object.values(x.totals).reduce((s,v)=>s+Math.abs(v),0));
+    else a.sort((x,y)=>y.usd-x.usd);
     return a;},[pend,groupBy]);
-  const grand=useMemo(()=>{const t={};pend.forEach(i=>t[i.moneda]=(t[i.moneda]||0)+i.total);return t;},[pend]);
+  const grandUsd=useMemo(()=>pend.reduce((s,i)=>s+usdOf(i),0),[pend]);
+  const sinTc=useMemo(()=>pend.filter(i=>!hasUsd(i)).length,[pend]);
 
   return <div>
     <div className="card" style={{padding:16,marginBottom:16}}>
@@ -205,16 +232,14 @@ function Pendientes({invoices,onMark}){
           {[["cliente","Cliente"],["mes","Mes"]].map(([k,l])=>
             <button key={k} onClick={()=>{setGroupBy(k);setOpen({});}} className="tab" style={groupBy===k?{background:"var(--card)",color:"var(--fg)"}:{}}>{l}</button>)}
         </div>
-        <select className="input" style={{width:"auto"}} value={cur} onChange={e=>setCur(e.target.value)}>
-          {["Todas",...CURRENCIES].map(o=><option key={o}>{o}</option>)}
-        </select>
         <button className="btn" onClick={()=>setSoloVenc(v=>!v)} style={soloVenc?{background:"var(--bad-bg)",color:"var(--bad)",border:"1px solid var(--bad)"}:{background:"var(--card)",color:"var(--muted-fg)",border:"1px solid var(--border)"}}>{soloVenc?"● Solo vencidas":"Solo vencidas"}</button>
         <input className="input" style={{flex:1,minWidth:180}} value={q} onChange={e=>setQ(e.target.value)} placeholder="Buscar cliente o factura…"/>
       </div>
       <div style={{display:"flex",flexWrap:"wrap",gap:"4px 22px",marginTop:12,fontSize:14,color:"var(--muted-fg)"}}>
         <span><b style={{color:"var(--fg)"}}>{pend.length}</b> por cobrar</span>
         <span><b style={{color:"var(--fg)"}}>{groups.length}</b> {groupBy==="cliente"?"clientes":"meses"}</span>
-        {CURRENCIES.filter(c=>grand[c]).map(c=><span key={c}>{CUR_LABEL[c]}: <b className="num" style={{color:"var(--warn)"}}>{fmtMoney(grand[c],c)}</b></span>)}
+        <span>Total por cobrar: <b className="num" style={{color:"var(--warn)"}}>{fmtUSD(grandUsd)}</b></span>
+        {sinTc>0&&<span style={{color:"var(--bad)"}}>{sinTc} sin tipo de cambio (no suman)</span>}
       </div>
     </div>
     {groups.length===0&&<div className="card" style={{padding:40,textAlign:"center",color:"var(--muted-fg)"}}>No hay pendientes con estos filtros. ¡Todo cobrado!</div>}
@@ -228,14 +253,28 @@ function Pendientes({invoices,onMark}){
             {g.venc>0&&<span className="badge" style={{background:"var(--bad-bg)",color:"var(--bad)"}}>{g.venc} vencida{g.venc!==1?"s":""}</span>}
           </div>
         </div>
-        <div className="num" style={{fontWeight:600,color:"var(--warn)",fontSize:14}}>{totals(g.totals)}</div>
+        <div className="num" style={{fontWeight:600,color:"var(--warn)",fontSize:14}}>{fmtUSD(g.usd)}</div>
       </button>
-      {o&&<div style={{borderTop:"1px solid var(--border)",overflowX:"auto"}}><table><tbody>
+      {o&&<div style={{borderTop:"1px solid var(--border)"}}>
+        {groupBy==="cliente"&&(()=>{const c=cliMap[g.key.toLowerCase()];const cs=c&&c.contactos&&c.contactos.length?c.contactos:null;
+          const primer=cs?cs.find(x=>x.telefono):null;
+          const tel=primer?(primer.telefono||"").replace(/[^0-9]/g,""):"";
+          const msg=encodeURIComponent(`Hola${primer&&primer.nombre?" "+primer.nombre:""}, te recordamos que figura un saldo pendiente de ${fmtUSD(g.usd)}. Para abonar:\n${datosCobro||"(datos de cobro no cargados)"}\n¡Gracias!`);
+          return <div style={{padding:"10px 16px",background:"var(--muted-bg)",fontSize:13}}>
+            {cs?<div style={{display:"flex",flexWrap:"wrap",gap:"6px 18px",alignItems:"center"}}>
+              {cs.map((ct,i)=><ContactoInline key={i} c={ct}/>)}
+            </div>:<span style={{color:"var(--muted-fg)"}}>Sin contactos cargados · agregalos en la pestaña Clientes</span>}
+            {(tel||datosCobro)&&<div style={{marginTop:8,display:"flex",gap:8,flexWrap:"wrap"}}>
+              {tel&&<a className="btn btn-primary" style={{padding:"5px 11px",textDecoration:"none"}} href={`https://wa.me/${tel}?text=${msg}`} target="_blank" rel="noreferrer">Recordar pago por WhatsApp</a>}
+              {datosCobro&&<button className="btn btn-ghost" style={{padding:"5px 11px"}} onClick={()=>{navigator.clipboard&&navigator.clipboard.writeText(datosCobro);}}>Copiar datos de cobro</button>}
+            </div>}
+          </div>;})()}
+        <div style={{overflowX:"auto"}}><table><tbody>
         {g.items.map(i=><tr key={i.id}>
           <td style={{fontWeight:600,whiteSpace:"nowrap"}}>{i.numeracion}</td>
           <td style={{color:"var(--muted-fg)"}}>{groupBy==="cliente"?monthLabel(monthKey(i.mes||i.fecha_emision)):i.cliente}</td>
           <td style={{color:"var(--muted-fg)"}}>{i.servicio}</td>
-          <td className="num" style={{fontWeight:600,whiteSpace:"nowrap"}}>{fmtMoney(i.total,i.moneda)}</td>
+          <td className="num" style={{fontWeight:600,whiteSpace:"nowrap"}}>{hasUsd(i)?fmtUSD(usdOf(i)):<span style={{color:"var(--bad)"}} title="Sin tipo de cambio">s/TC</span>}{i.moneda!=="USD"&&<span style={{color:"var(--muted-fg)",fontWeight:400,fontSize:12}}> · {fmtMoney(i.total,i.moneda)}</span>}</td>
           <td style={{fontSize:12,whiteSpace:"nowrap",color:i.fecha_vencimiento&&i.fecha_vencimiento<hoy?"var(--bad)":"var(--muted-fg)"}}>
             {!i.fecha_vencimiento?"—":i.fecha_vencimiento<hoy?`vencida hace ${Math.round((Date.parse(hoy)-Date.parse(i.fecha_vencimiento))/86400000)} d`:`vence ${i.fecha_vencimiento}`}</td>
           <td style={{textAlign:"right",whiteSpace:"nowrap"}}>
@@ -243,26 +282,103 @@ function Pendientes({invoices,onMark}){
             <button className="btn btn-ghost" style={{padding:"6px 9px",marginLeft:4,color:"var(--bad)"}} title="Perdida" onClick={()=>{if(confirm("¿Marcar como perdida (incobrable)?"))onMark(i.id,{estado:"Perdido"});}}>⚠</button>
           </td>
         </tr>)}
-      </tbody></table></div>}
+      </tbody></table></div></div>}
     </div>;})}
     {cobrar&&<CobrarModal inv={cobrar} onClose={()=>setCobrar(null)} onConfirm={d=>{onMark(cobrar.id,{estado:"Cobrado",...d});setCobrar(null);}}/>}
   </div>;
 }
 
-/* ---------- Resumen ---------- */
-function Resumen({invoices}){
-  const t=useMemo(()=>{const o={};CURRENCIES.forEach(c=>o[c]={Cobrado:0,Pendiente:0,Perdido:0});
-    invoices.forEach(i=>{if(o[i.moneda]&&o[i.moneda][i.estado]!=null)o[i.moneda][i.estado]+=i.total;});return o;},[invoices]);
-  const Kpi=({label,key2,color})=><div className="card" style={{padding:20}}>
-    <div style={{fontWeight:600,marginBottom:10,color}}>{label}</div>
-    {CURRENCIES.map(c=><div key={c} style={{display:"flex",justifyContent:"space-between",margin:"6px 0"}}>
-      <span style={{fontSize:13,color:"var(--muted-fg)"}}>{CUR_LABEL[c]}</span>
-      <span className="num" style={{fontWeight:700,fontSize:17}}>{fmtMoney(t[c][key2],c)}</span></div>)}
+/* ---------- Gráfica lineal (SVG) ---------- */
+const SERVICIOS=["TuFud","TuShopper","Deri","Otro"];
+const SERV_COLOR={Total:"#0f5c4a",TuFud:"#3b6cf4",TuShopper:"#0f8a5f",Deri:"#b8791b",Otro:"#9b59b6",Costo:"#c0392b"};
+function LineChart({data,series,height=290,fmtY}){
+  const [hidden,setHidden]=useState({});
+  const W=720,H=height,padL=52,padR=14,padT=14,padB=30;
+  const active=series.filter(s=>!hidden[s.key]);
+  const maxV=Math.max(1,...data.flatMap(d=>active.map(s=>d[s.key]||0)));
+  const n=data.length;
+  const x=i=>padL+(n<=1?0:i*(W-padL-padR)/(n-1));
+  const y=v=>padT+(H-padT-padB)*(1-v/maxV);
+  const ticks=[0,1,2,3,4].map(i=>maxV*i/4);
+  const skip=Math.ceil(n/9);
+  if(!n)return <div style={{padding:24,color:"var(--muted-fg)"}}>Sin datos para esta moneda.</div>;
+  return <div>
+    <svg viewBox={`0 0 ${W} ${H}`} style={{width:"100%",height:"auto"}}>
+      {ticks.map((tv,i)=><g key={i}>
+        <line x1={padL} x2={W-padR} y1={y(tv)} y2={y(tv)} stroke="var(--grid)"/>
+        <text x={padL-6} y={y(tv)+3} textAnchor="end" fontSize="10" fill="var(--muted-fg)">{fmtY?fmtY(tv):Math.round(tv)}</text>
+      </g>)}
+      {data.map((d,i)=>(n<=9||i%skip===0||i===n-1)?<text key={i} x={x(i)} y={H-9} textAnchor="middle" fontSize="10" fill="var(--muted-fg)">{d.label}</text>:null)}
+      {active.map(s=>{
+        const pts=data.map((d,i)=>`${x(i)},${y(d[s.key]||0)}`).join(" ");
+        return <g key={s.key}>
+          <polyline points={pts} fill="none" stroke={s.color} strokeWidth={s.dash?1.8:2.2} strokeDasharray={s.dash?"6 4":undefined}/>
+          {!s.dash&&data.map((d,i)=><circle key={i} cx={x(i)} cy={y(d[s.key]||0)} r="2.6" fill={s.color}><title>{`${s.label} · ${d.label}: ${fmtY?fmtY(d[s.key]||0):d[s.key]||0}`}</title></circle>)}
+        </g>;
+      })}
+    </svg>
+    <div style={{display:"flex",flexWrap:"wrap",gap:14,marginTop:6}}>
+      {series.map(s=><button key={s.key} onClick={()=>setHidden(h=>({...h,[s.key]:!h[s.key]}))} style={{display:"inline-flex",alignItems:"center",gap:6,background:"none",border:"none",cursor:"pointer",opacity:hidden[s.key]?.35:1,fontSize:13,color:"var(--fg)",padding:0}}>
+        <span style={{width:16,height:s.dash?0:3,borderTop:s.dash?`2px dashed ${s.color}`:"none",borderRadius:2,background:s.dash?"none":s.color,display:"inline-block"}}/>{s.label}
+      </button>)}
+    </div>
   </div>;
-  return <div style={{display:"grid",gap:16,gridTemplateColumns:"repeat(auto-fit,minmax(240px,1fr))"}}>
-    <Kpi label="Cobrado" key2="Cobrado" color="var(--ok)"/>
-    <Kpi label="Por cobrar" key2="Pendiente" color="var(--warn)"/>
-    <Kpi label="Perdido" key2="Perdido" color="var(--bad)"/>
+}
+
+/* ---------- Resumen ---------- */
+function Resumen({invoices,costos}){
+  const t=useMemo(()=>{const o={Cobrado:0,Pendiente:0,Perdido:0};invoices.forEach(i=>{if(o[i.estado]!=null)o[i.estado]+=usdOf(i);});return o;},[invoices]);
+  const sinTc=useMemo(()=>invoices.filter(i=>(i.estado==="Cobrado"||i.estado==="Pendiente"||i.estado==="Perdido")&&!hasUsd(i)).length,[invoices]);
+  const Kpi=({label,val,color})=><div className="card" style={{padding:20}}>
+    <div style={{fontWeight:600,marginBottom:6,color}}>{label}</div>
+    <div className="num" style={{fontWeight:700,fontSize:24}}>{fmtUSD(val)}</div>
+  </div>;
+
+  // costos mensuales en USD (los items cargados en USD)
+  const costoMensual=useMemo(()=>(costos||[]).filter(c=>c.moneda==="USD").reduce((s,c)=>s+Number(c.monto||0),0),[costos]);
+  const costoNoUsd=useMemo(()=>(costos||[]).filter(c=>c.moneda!=="USD").length,[costos]);
+
+  // facturación mensual por servicio en USD (excluye Anuladas y Neteadas)
+  const chart=useMemo(()=>{
+    const m={};
+    invoices.forEach(i=>{
+      if(i.estado==="Anulado"||i.estado==="Neteado")return;
+      const mk=monthKey(i.mes||i.fecha_emision);if(!mk)return;
+      const s=SERVICIOS.includes(i.servicio)?i.servicio:"Otro";
+      m[mk]=m[mk]||{mk,Total:0,TuFud:0,TuShopper:0,Deri:0,Otro:0};
+      const v=usdOf(i);m[mk][s]+=v;m[mk].Total+=v;
+    });
+    return Object.values(m).sort((a,b)=>a.mk.localeCompare(b.mk)).map(r=>({...r,label:monthLabel(r.mk),Costo:costoMensual}));
+  },[invoices,costoMensual]);
+
+  const series=[{key:"Total",color:SERV_COLOR.Total,label:"Total"},...SERVICIOS.map(s=>({key:s,color:SERV_COLOR[s],label:s}))];
+  if(costoMensual>0)series.push({key:"Costo",color:SERV_COLOR.Costo,label:"Costo mensual",dash:true});
+  const ultimo=chart.length?chart[chart.length-1]:null;
+  const resultado=ultimo?ultimo.Total-costoMensual:0;
+
+  return <div style={{display:"flex",flexDirection:"column",gap:16}}>
+    <div style={{display:"grid",gap:16,gridTemplateColumns:"repeat(auto-fit,minmax(200px,1fr))"}}>
+      <Kpi label="Cobrado" val={t.Cobrado} color="var(--ok)"/>
+      <Kpi label="Por cobrar" val={t.Pendiente} color="var(--warn)"/>
+      <Kpi label="Perdido" val={t.Perdido} color="var(--bad)"/>
+    </div>
+    {sinTc>0&&<div className="card" style={{padding:"10px 16px",fontSize:13,color:"var(--bad)"}}>{sinTc} factura(s) sin tipo de cambio en el Excel: no están sumando en dólares. Se corrige al importar un Excel con el TC cargado en esas filas.</div>}
+
+    <div className="card" style={{padding:20}}>
+      <h3 className="font-display" style={{margin:"0 0 4px",fontSize:19}}>Facturación por servicio (USD)</h3>
+      <p style={{margin:"0 0 10px",fontSize:12,color:"var(--muted-fg)"}}>Total facturado por mes y por servicio, consolidado en dólares. Tocá la leyenda para mostrar/ocultar líneas.{costoMensual>0?" La línea punteada es tu costo mensual: donde el Total queda por encima, hay ganancia.":""}</p>
+      <LineChart data={chart} series={series} fmtY={v=>"US$ "+(Math.abs(v)>=1000?(v/1000).toFixed(0)+"k":Math.round(v))}/>
+    </div>
+
+    {costoMensual>0&&ultimo&&<div className="card" style={{padding:20}}>
+      <h3 className="font-display" style={{margin:"0 0 4px",fontSize:19}}>Resultado — {ultimo.label} (USD)</h3>
+      <div style={{display:"grid",gap:12,gridTemplateColumns:"repeat(auto-fit,minmax(160px,1fr))",marginTop:10}}>
+        <div><div style={{fontSize:12,color:"var(--muted-fg)"}}>Facturado</div><div className="num" style={{fontSize:20,fontWeight:700}}>{fmtUSD(ultimo.Total)}</div></div>
+        <div><div style={{fontSize:12,color:"var(--muted-fg)"}}>Costo mensual</div><div className="num" style={{fontSize:20,fontWeight:700,color:"var(--bad)"}}>{fmtUSD(costoMensual)}</div></div>
+        <div><div style={{fontSize:12,color:"var(--muted-fg)"}}>Resultado</div><div className="num" style={{fontSize:20,fontWeight:700,color:resultado>=0?"var(--ok)":"var(--bad)"}}>{fmtUSD(resultado)}</div></div>
+      </div>
+      {costoNoUsd>0&&<p style={{marginTop:12,fontSize:12,color:"var(--bad)"}}>Tenés {costoNoUsd} costo(s) cargado(s) en otra moneda que no se están sumando. Para el resultado en dólares, cargá los costos en USD.</p>}
+    </div>}
   </div>;
 }
 
@@ -279,11 +395,12 @@ function Facturas({invoices,onMark}){
       <select className="input" style={{width:"auto"}} value={mon} onChange={e=>setMon(e.target.value)}>{["Todas",...CURRENCIES].map(o=><option key={o}>{o}</option>)}</select>
     </div>
     <div className="card" style={{overflow:"hidden"}}><div style={{overflowX:"auto"}}><table>
-      <thead><tr>{["Cliente","Factura","Servicio","Mes","Total","Estado",""].map(h=><th key={h}>{h}</th>)}</tr></thead>
+      <thead><tr>{["Cliente","Factura","Servicio","Mes","Total USD","Original","Estado",""].map(h=><th key={h}>{h}</th>)}</tr></thead>
       <tbody>{list.map(i=><tr key={i.id}>
         <td style={{fontWeight:500}}>{i.cliente}</td><td style={{whiteSpace:"nowrap",color:"var(--muted-fg)"}}>{i.numeracion}</td>
         <td style={{color:"var(--muted-fg)"}}>{i.servicio}</td><td style={{whiteSpace:"nowrap",color:"var(--muted-fg)"}}>{monthLabel(monthKey(i.mes||i.fecha_emision))}</td>
-        <td className="num" style={{fontWeight:600,whiteSpace:"nowrap"}}>{fmtMoney(i.total,i.moneda)}</td><td><Badge estado={i.estado}/></td>
+        <td className="num" style={{fontWeight:600,whiteSpace:"nowrap"}}>{hasUsd(i)?fmtUSD(usdOf(i)):<span style={{color:"var(--bad)"}} title="Sin tipo de cambio">s/TC</span>}</td>
+        <td className="num" style={{whiteSpace:"nowrap",color:"var(--muted-fg)"}}>{fmtMoney(i.total,i.moneda)}</td><td><Badge estado={i.estado}/></td>
         <td style={{textAlign:"right"}}>{i.estado!=="Cobrado"&&<button className="btn btn-ghost" style={{padding:"5px 9px",color:"var(--ok)"}} title="Marcar cobrada" onClick={()=>onMark(i.id,{estado:"Cobrado",fecha_pago:todayISO()})}>✓</button>}</td>
       </tr>)}</tbody>
     </table></div></div>
@@ -306,6 +423,177 @@ function Importar({onDone,total}){
     {msg&&<div style={{marginTop:16,padding:12,borderRadius:11,background:"var(--ok-bg)",color:"var(--ok)",fontSize:14}}>{msg}</div>}
     {err&&<div style={{marginTop:16,padding:12,borderRadius:11,background:"var(--bad-bg)",color:"var(--bad)",fontSize:14}}>{err}</div>}
     <p style={{marginTop:18,fontSize:13,color:"var(--muted-fg)"}}>En la base hay <b style={{color:"var(--fg)"}}>{total}</b> facturas.</p>
+  </div>;
+}
+
+/* ---------- Clientes / Contactos ---------- */
+function ContactoInline({c}){
+  const tel=(c.telefono||"").replace(/[^0-9+]/g,"").replace(/^\+/,"");
+  return <span style={{display:"inline-flex",gap:8,alignItems:"center"}}>
+    <b>{c.nombre||"—"}</b>
+    {c.email&&<a href={"mailto:"+c.email} style={{color:"var(--accent)"}}>{c.email}</a>}
+    {c.telefono&&<a href={"tel:"+c.telefono} style={{color:"var(--accent)"}}>{c.telefono}</a>}
+    {tel&&<a href={"https://wa.me/"+tel} target="_blank" rel="noreferrer" style={{color:"var(--ok)"}}>WhatsApp</a>}
+  </span>;
+}
+
+function ClienteForm({cliente,invoiceNames,onClose,onSave}){
+  const [nombre,setNombre]=useState(cliente?cliente.nombre:"");
+  const [contactos,setContactos]=useState(cliente&&cliente.contactos&&cliente.contactos.length?cliente.contactos:[{nombre:"",email:"",telefono:""}]);
+  const [notas,setNotas]=useState(cliente?cliente.notas||"":"");
+  const [busy,setBusy]=useState(false);const [err,setErr]=useState("");
+  const setC=(i,k,v)=>setContactos(cs=>cs.map((c,idx)=>idx===i?{...c,[k]:v}:c));
+  const addC=()=>setContactos(cs=>[...cs,{nombre:"",email:"",telefono:""}]);
+  const delC=i=>setContactos(cs=>cs.filter((_,idx)=>idx!==i));
+  const submit=async()=>{
+    if(!nombre.trim()){setErr("Poné el nombre de la empresa.");return;}
+    setBusy(true);setErr("");
+    try{await onSave({id:cliente?cliente.id:null,nombre:nombre.trim(),contactos:contactos.filter(c=>c.nombre||c.email||c.telefono),notas:notas.trim()});onClose();}
+    catch(e){setErr(e.message||String(e));setBusy(false);}
+  };
+  return <div className="modal-bg" onClick={onClose}>
+    <div className="card" style={{padding:24,width:"100%",maxWidth:540,maxHeight:"86vh",overflowY:"auto"}} onClick={e=>e.stopPropagation()}>
+      <h3 className="font-display" style={{fontSize:20,margin:"0 0 12px"}}>{cliente?"Editar cliente":"Nuevo cliente"}</h3>
+      <label style={{fontSize:12,fontWeight:600,color:"var(--muted-fg)"}}>Empresa</label>
+      <input className="input" list="fact-clientes" value={nombre} onChange={e=>setNombre(e.target.value)} style={{margin:"4px 0 4px"}} placeholder="Razón social / nombre"/>
+      <datalist id="fact-clientes">{invoiceNames.map(n=><option key={n} value={n}/>)}</datalist>
+      <p style={{fontSize:12,color:"var(--muted-fg)",margin:"0 0 14px"}}>Elegí el nombre tal como aparece en las facturas para que se asocie la deuda. La lista te sugiere los que ya tenés facturados.</p>
+      <label style={{fontSize:12,fontWeight:600,color:"var(--muted-fg)"}}>Contactos</label>
+      {contactos.map((c,i)=><div key={i} style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr auto",gap:6,margin:"6px 0"}}>
+        <input className="input" value={c.nombre} onChange={e=>setC(i,"nombre",e.target.value)} placeholder="Nombre"/>
+        <input className="input" value={c.email} onChange={e=>setC(i,"email",e.target.value)} placeholder="Email"/>
+        <input className="input" value={c.telefono} onChange={e=>setC(i,"telefono",e.target.value)} placeholder="Celular"/>
+        <button className="btn btn-ghost" style={{padding:"0 10px",color:"var(--bad)"}} onClick={()=>delC(i)} title="Quitar">✕</button>
+      </div>)}
+      <button className="btn btn-ghost" style={{marginTop:4}} onClick={addC}>+ Agregar contacto</button>
+      <label style={{fontSize:12,fontWeight:600,color:"var(--muted-fg)",display:"block",margin:"16px 0 4px"}}>Notas (opcional)</label>
+      <textarea className="input" rows={2} value={notas} onChange={e=>setNotas(e.target.value)} placeholder="Datos de cobranza, condiciones, etc."/>
+      {err&&<div style={{marginTop:12,padding:10,borderRadius:10,background:"var(--bad-bg)",color:"var(--bad)",fontSize:13}}>{err}</div>}
+      <div style={{display:"flex",gap:8,justifyContent:"flex-end",marginTop:18}}>
+        <button className="btn btn-ghost" onClick={onClose}>Cancelar</button>
+        <button className="btn btn-primary" onClick={submit} disabled={busy}>{busy?"Guardando…":"Guardar"}</button>
+      </div>
+    </div>
+  </div>;
+}
+
+function DatosCobro({valor,onSave}){
+  const [txt,setTxt]=useState(valor||"");const [busy,setBusy]=useState(false);const [ok,setOk]=useState(false);
+  useEffect(()=>{setTxt(valor||"");},[valor]);
+  const save=async()=>{setBusy(true);setOk(false);try{await onSave(txt);setOk(true);setTimeout(()=>setOk(false),2000);}catch(e){}setBusy(false);};
+  return <div className="card" style={{padding:16,marginBottom:16}}>
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:10}}>
+      <b>Datos de cobro (CVU / alias para pasar a los deudores)</b>
+      <button className="btn btn-primary" style={{padding:"6px 12px"}} onClick={save} disabled={busy}>{busy?"…":"Guardar"}</button>
+    </div>
+    <textarea className="input" rows={3} value={txt} onChange={e=>setTxt(e.target.value)} style={{marginTop:8,fontFamily:"inherit"}} placeholder={"Ej.\nCVU: 0000000000000000000000\nAlias: dixtra.cobros\nTitular: Tolenka SRL"}/>
+    <p style={{margin:"6px 0 0",fontSize:12,color:"var(--muted-fg)"}}>Se usa en el botón “Recordar pago por WhatsApp” de cada deudor en Pendientes. Actualizalo cuando cambie el CVU.{ok&&<b style={{color:"var(--ok)"}}> Guardado.</b>}</p>
+  </div>;
+}
+
+function ClientesView({clientes,invoices,onSave,onDelete,datosCobro,onSaveDatos}){
+  const [q,setQ]=useState("");const [editing,setEditing]=useState(undefined); // undefined=cerrado, null=nuevo, obj=editar
+  const invoiceNames=useMemo(()=>[...new Set(invoices.map(i=>i.cliente))].sort(),[invoices]);
+  const deuda=useMemo(()=>deudaPorCliente(invoices),[invoices]);
+  const list=clientes.filter(c=>(c.nombre||"").toLowerCase().includes(q.trim().toLowerCase()));
+  return <div>
+    <DatosCobro valor={datosCobro} onSave={onSaveDatos}/>
+    <div className="card" style={{padding:16,marginBottom:16,display:"flex",gap:12,flexWrap:"wrap",alignItems:"center"}}>
+      <input className="input" style={{flex:1,minWidth:200}} value={q} onChange={e=>setQ(e.target.value)} placeholder="Buscar empresa…"/>
+      <button className="btn btn-primary" onClick={()=>setEditing(null)}>+ Nuevo cliente</button>
+    </div>
+    {clientes.length===0&&<div className="card" style={{padding:32,textAlign:"center",color:"var(--muted-fg)"}}>Todavía no cargaste clientes. Tocá “Nuevo cliente” para empezar a asociar contactos a las deudas.</div>}
+    <div style={{display:"grid",gap:12,gridTemplateColumns:"repeat(auto-fill,minmax(300px,1fr))"}}>
+      {list.map(c=>{const d=deuda[(c.nombre||"").toLowerCase()];const dl=d&&d.usd?fmtUSD(d.usd):"";return <div key={c.id} className="card" style={{padding:16}}>
+        <div style={{display:"flex",justifyContent:"space-between",gap:8,alignItems:"start"}}>
+          <h4 style={{margin:0,fontWeight:600}}>{c.nombre}</h4>
+          <div style={{display:"flex",gap:4}}>
+            <button className="btn btn-ghost" style={{padding:"4px 9px"}} onClick={()=>setEditing(c)}>Editar</button>
+            <button className="btn btn-ghost" style={{padding:"4px 9px",color:"var(--bad)"}} onClick={()=>{if(confirm("¿Eliminar este cliente? (no borra sus facturas)"))onDelete(c.id);}}>✕</button>
+          </div>
+        </div>
+        <div style={{marginTop:6,fontSize:13}}>
+          {dl?<span style={{color:"var(--warn)"}}>Debe: <b className="num">{dl}</b></span>:<span style={{color:"var(--ok)"}}>Sin deuda pendiente</span>}
+        </div>
+        <div style={{marginTop:10,paddingTop:10,borderTop:"1px solid var(--border)",display:"flex",flexDirection:"column",gap:6,fontSize:13}}>
+          {c.contactos&&c.contactos.length?c.contactos.map((ct,i)=><ContactoInline key={i} c={ct}/>):<span style={{color:"var(--muted-fg)"}}>Sin contactos</span>}
+        </div>
+        {c.notas&&<p style={{marginTop:10,fontSize:12,color:"var(--muted-fg)"}}>{c.notas}</p>}
+      </div>;})}
+    </div>
+    {editing!==undefined&&<ClienteForm cliente={editing} invoiceNames={invoiceNames} onClose={()=>setEditing(undefined)} onSave={onSave}/>}
+  </div>;
+}
+
+/* ---------- Costos ---------- */
+function CostoForm({costo,onClose,onSave}){
+  const [f,setF]=useState(costo?{...costo}:{concepto:"",servicio:"General",monto:"",moneda:"USD",notas:""});
+  const [busy,setBusy]=useState(false);const [err,setErr]=useState("");
+  const set=(k,v)=>setF(p=>({...p,[k]:v}));
+  const submit=async()=>{
+    if(!f.concepto.trim()||f.monto===""){setErr("Poné el concepto y el monto.");return;}
+    setBusy(true);setErr("");
+    try{await onSave({id:costo?costo.id:null,concepto:f.concepto.trim(),servicio:f.servicio,monto:Number(f.monto),moneda:f.moneda,notas:(f.notas||"").trim()});onClose();}
+    catch(e){setErr(e.message||String(e));setBusy(false);}
+  };
+  return <div className="modal-bg" onClick={onClose}>
+    <div className="card" style={{padding:24,width:"100%",maxWidth:480}} onClick={e=>e.stopPropagation()}>
+      <h3 className="font-display" style={{fontSize:20,margin:"0 0 12px"}}>{costo?"Editar costo":"Nuevo costo mensual"}</h3>
+      <label style={{fontSize:12,fontWeight:600,color:"var(--muted-fg)"}}>Concepto</label>
+      <input className="input" value={f.concepto} onChange={e=>set("concepto",e.target.value)} style={{margin:"4px 0 12px"}} placeholder="Ej. Servidores AWS, licencia, sueldo mantenimiento…"/>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:10}}>
+        <div><label style={{fontSize:12,fontWeight:600,color:"var(--muted-fg)"}}>Servicio</label>
+          <select className="input" value={f.servicio} onChange={e=>set("servicio",e.target.value)}>{["General",...SERVICIOS].map(s=><option key={s}>{s}</option>)}</select></div>
+        <div><label style={{fontSize:12,fontWeight:600,color:"var(--muted-fg)"}}>Monto / mes</label>
+          <input className="input num" type="number" value={f.monto} onChange={e=>set("monto",e.target.value)} placeholder="0.00"/></div>
+        <div><label style={{fontSize:12,fontWeight:600,color:"var(--muted-fg)"}}>Moneda</label>
+          <select className="input" value={f.moneda} onChange={e=>set("moneda",e.target.value)}>{CURRENCIES.map(c=><option key={c}>{c}</option>)}</select></div>
+      </div>
+      <label style={{fontSize:12,fontWeight:600,color:"var(--muted-fg)",display:"block",margin:"12px 0 4px"}}>Notas (opcional)</label>
+      <input className="input" value={f.notas} onChange={e=>set("notas",e.target.value)}/>
+      {err&&<div style={{marginTop:12,padding:10,borderRadius:10,background:"var(--bad-bg)",color:"var(--bad)",fontSize:13}}>{err}</div>}
+      <div style={{display:"flex",gap:8,justifyContent:"flex-end",marginTop:18}}>
+        <button className="btn btn-ghost" onClick={onClose}>Cancelar</button>
+        <button className="btn btn-primary" onClick={submit} disabled={busy}>{busy?"Guardando…":"Guardar"}</button>
+      </div>
+    </div>
+  </div>;
+}
+
+function CostosView({costos,onSave,onDelete}){
+  const [editing,setEditing]=useState(undefined);
+  const totalPorMoneda=useMemo(()=>{const t={};costos.forEach(c=>t[c.moneda]=(t[c.moneda]||0)+Number(c.monto||0));return t;},[costos]);
+  const grupos=useMemo(()=>{const g={};costos.forEach(c=>{g[c.servicio]=g[c.servicio]||[];g[c.servicio].push(c);});return g;},[costos]);
+  const orden=["General",...SERVICIOS];
+  return <div>
+    <div className="card" style={{padding:16,marginBottom:16,display:"flex",gap:12,flexWrap:"wrap",alignItems:"center"}}>
+      <div style={{flex:1,minWidth:200}}>
+        <div style={{fontSize:13,color:"var(--muted-fg)"}}>Costos mensuales totales</div>
+        <div className="num" style={{fontWeight:700,fontSize:16}}>{CURRENCIES.filter(c=>totalPorMoneda[c]).map(c=>fmtMoney(totalPorMoneda[c],c)).join("  ·  ")||"—"}</div>
+      </div>
+      <button className="btn btn-primary" onClick={()=>setEditing(null)}>+ Nuevo costo</button>
+    </div>
+    {costos.length===0&&<div className="card" style={{padding:32,textAlign:"center",color:"var(--muted-fg)"}}>Todavía no cargaste costos. Agregá los gastos mensuales de mantenimiento (por servicio o generales) para ver la rentabilidad en el Resumen.</div>}
+    {orden.filter(s=>grupos[s]).map(s=>{
+      const items=grupos[s];const tot={};items.forEach(c=>tot[c.moneda]=(tot[c.moneda]||0)+Number(c.monto||0));
+      return <div key={s} className="card" style={{padding:0,marginBottom:12,overflow:"hidden"}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"12px 16px",background:"var(--muted-bg)"}}>
+          <b>{s==="General"?"Generales (todo el sistema)":s}</b>
+          <span className="num" style={{fontSize:13,color:"var(--muted-fg)"}}>{CURRENCIES.filter(c=>tot[c]).map(c=>fmtMoney(tot[c],c)).join("  ·  ")}</span>
+        </div>
+        <div style={{overflowX:"auto"}}><table><tbody>
+          {items.map(c=><tr key={c.id}>
+            <td style={{fontWeight:500}}>{c.concepto}{c.notas&&<div style={{fontSize:12,color:"var(--muted-fg)"}}>{c.notas}</div>}</td>
+            <td className="num" style={{fontWeight:600,whiteSpace:"nowrap"}}>{fmtMoney(c.monto,c.moneda)}</td>
+            <td style={{textAlign:"right",whiteSpace:"nowrap"}}>
+              <button className="btn btn-ghost" style={{padding:"4px 9px"}} onClick={()=>setEditing(c)}>Editar</button>
+              <button className="btn btn-ghost" style={{padding:"4px 9px",marginLeft:4,color:"var(--bad)"}} onClick={()=>{if(confirm("¿Eliminar este costo?"))onDelete(c.id);}}>✕</button>
+            </td>
+          </tr>)}
+        </tbody></table></div>
+      </div>;
+    })}
+    {editing!==undefined&&<CostoForm costo={editing} onClose={()=>setEditing(undefined)} onSave={onSave}/>}
   </div>;
 }
 
@@ -341,8 +629,10 @@ function Login(){
 /* ---------- App ---------- */
 function App(){
   const [session,setSession]=useState(undefined); // undefined = verificando
-  const [inv,setInv]=useState([]);const [loading,setLoading]=useState(true);const [tab,setTab]=useState("pendientes");const [error,setError]=useState("");
-  const load=useCallback(async()=>{setLoading(true);try{setInv(await fetchAll());setError("");}catch(e){setError(e.message||String(e));}setLoading(false);},[]);
+  const [inv,setInv]=useState([]);const [clientes,setClientes]=useState([]);const [costos,setCostos]=useState([]);const [config,setConfig]=useState({});const [loading,setLoading]=useState(true);const [tab,setTab]=useState("pendientes");const [error,setError]=useState("");
+  const load=useCallback(async()=>{setLoading(true);try{const [f,c,co,cf]=await Promise.all([fetchAll(),fetchClientes(),fetchCostos(),fetchConfig()]);setInv(f);setClientes(c);setCostos(co);setConfig(cf);setError("");}catch(e){setError(e.message||String(e));}setLoading(false);},[]);
+  const reloadClientes=useCallback(async()=>{try{setClientes(await fetchClientes());}catch(e){setError(e.message||String(e));}},[]);
+  const reloadCostos=useCallback(async()=>{try{setCostos(await fetchCostos());}catch(e){setError(e.message||String(e));}},[]);
 
   useEffect(()=>{
     if(!CONFIGURED){setSession(null);return;}
@@ -353,7 +643,12 @@ function App(){
   useEffect(()=>{if(session)load();},[session]);
 
   const onMark=async(id,patch)=>{await updateInvoice(id,patch);setInv(prev=>prev.map(i=>i.id===id?{...i,...patch}:i));};
-  const logout=async()=>{await sb.auth.signOut();setInv([]);};
+  const onSaveCliente=async(c)=>{await saveClienteDB(c);await reloadClientes();};
+  const onDeleteCliente=async(id)=>{await deleteClienteDB(id);await reloadClientes();};
+  const onSaveCosto=async(c)=>{await saveCostoDB(c);await reloadCostos();};
+  const onDeleteCosto=async(id)=>{await deleteCostoDB(id);await reloadCostos();};
+  const onSaveDatos=async(txt)=>{await saveConfigDB("datos_cobro",txt);setConfig(c=>({...c,datos_cobro:txt}));};
+  const logout=async()=>{await sb.auth.signOut();setInv([]);setClientes([]);setCostos([]);setConfig({});};
 
   if(!CONFIGURED)return <div className="wrap"><div className="card" style={{padding:28}}>
     <h2 className="font-display">Falta configurar Supabase</h2>
@@ -363,7 +658,7 @@ function App(){
   if(session===undefined)return <div className="wrap" style={{paddingTop:80,textAlign:"center",color:"var(--muted-fg)"}}>Cargando…</div>;
   if(!session)return <Login/>;
 
-  const TABS=[["pendientes","Pendientes"],["dashboard","Resumen"],["facturas","Facturas"],["importar","Importar"]];
+  const TABS=[["pendientes","Pendientes"],["dashboard","Resumen"],["facturas","Facturas"],["clientes","Clientes"],["costos","Costos"],["importar","Importar"]];
   return <div className="wrap">
     <header style={{display:"flex",alignItems:"center",gap:12,marginBottom:20}}>
       <span style={{display:"grid",placeItems:"center",width:44,height:44,borderRadius:14,background:"var(--accent)",color:"#fff",fontSize:22}}>$</span>
@@ -379,9 +674,11 @@ function App(){
     </nav>
     {error&&<div className="card" style={{padding:16,marginBottom:16,color:"var(--bad)"}}>Error: {error}</div>}
     {loading?<div style={{color:"var(--muted-fg)"}}>Cargando…</div>:<>
-      {tab==="pendientes"&&<Pendientes invoices={inv} onMark={onMark}/>}
-      {tab==="dashboard"&&<Resumen invoices={inv}/>}
+      {tab==="pendientes"&&<Pendientes invoices={inv} onMark={onMark} clientes={clientes} datosCobro={config.datos_cobro}/>}
+      {tab==="dashboard"&&<Resumen invoices={inv} costos={costos}/>}
       {tab==="facturas"&&<Facturas invoices={inv} onMark={onMark}/>}
+      {tab==="clientes"&&<ClientesView clientes={clientes} invoices={inv} onSave={onSaveCliente} onDelete={onDeleteCliente} datosCobro={config.datos_cobro} onSaveDatos={onSaveDatos}/>}
+      {tab==="costos"&&<CostosView costos={costos} onSave={onSaveCosto} onDelete={onDeleteCosto}/>}
       {tab==="importar"&&<Importar onDone={load} total={inv.length}/>}
     </>}
     <footer style={{marginTop:32,textAlign:"center",fontSize:12,color:"var(--muted-fg)"}}>Datos protegidos · solo usuarios autorizados.</footer>
