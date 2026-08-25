@@ -325,8 +325,42 @@ function LineChart({data,series,height=290,fmtY}){
   </div>;
 }
 
+/* ---------- Gráfica de barras (SVG) ---------- */
+function BarChart({data,series,height=300,fmtY}){
+  const W=720,H=height,padL=54,padR=14,padT=14,padB=48;
+  const maxV=Math.max(1,...data.flatMap(d=>series.map(s=>d[s.key]||0)));
+  const n=data.length||1;
+  const groupW=(W-padL-padR)/n;
+  const gap=6,innerPad=groupW*0.16;
+  const barW=Math.max(4,(groupW-2*innerPad-(series.length-1)*gap)/series.length);
+  const y=v=>padT+(H-padT-padB)*(1-v/maxV);
+  const ticks=[0,1,2,3,4].map(i=>maxV*i/4);
+  const y0=y(0);
+  return <div>
+    <svg viewBox={`0 0 ${W} ${H}`} style={{width:"100%",height:"auto"}}>
+      {ticks.map((tv,i)=><g key={i}>
+        <line x1={padL} x2={W-padR} y1={y(tv)} y2={y(tv)} stroke="var(--grid)"/>
+        <text x={padL-6} y={y(tv)+3} textAnchor="end" fontSize="10" fill="var(--muted-fg)">{fmtY?fmtY(tv):Math.round(tv)}</text>
+      </g>)}
+      {data.map((d,gi)=>{const gx=padL+gi*groupW+innerPad;const net=(d[series[0].key]||0)-(d[series[1].key]||0);
+        return <g key={gi}>
+          {series.map((s,si)=>{const val=d[s.key]||0;const x=gx+si*(barW+gap);const yy=y(val);
+            return <rect key={si} x={x} y={yy} width={barW} height={Math.max(0,y0-yy)} fill={s.color} rx="3"><title>{`${d.label} · ${s.label}: ${fmtY?fmtY(val):val}`}</title></rect>;})}
+          <text x={padL+gi*groupW+groupW/2} y={H-28} textAnchor="middle" fontSize="12" fontWeight="600" fill="var(--fg)">{d.label}</text>
+          <text x={padL+gi*groupW+groupW/2} y={H-12} textAnchor="middle" fontSize="11" fill={net>=0?"var(--ok)":"var(--bad)"}>{(net>=0?"+":"")+(fmtY?fmtY(net):net)}</text>
+        </g>;})}
+    </svg>
+    <div style={{display:"flex",flexWrap:"wrap",gap:14,marginTop:6}}>
+      {series.map(s=><span key={s.key} style={{display:"inline-flex",alignItems:"center",gap:6,fontSize:13,color:"var(--fg)"}}>
+        <span style={{width:14,height:12,borderRadius:3,background:s.color,display:"inline-block"}}/>{s.label}
+      </span>)}
+    </div>
+  </div>;
+}
+
 /* ---------- Resumen ---------- */
 function Resumen({invoices,costos}){
+  const [barWin,setBarWin]=useState(6);
   const t=useMemo(()=>{const o={Cobrado:0,Pendiente:0,Perdido:0};invoices.forEach(i=>{if(o[i.estado]!=null)o[i.estado]+=usdOf(i);});return o;},[invoices]);
   const sinTc=useMemo(()=>invoices.filter(i=>(i.estado==="Cobrado"||i.estado==="Pendiente"||i.estado==="Perdido")&&!hasUsd(i)).length,[invoices]);
   const Kpi=({label,val,color})=><div className="card" style={{padding:20}}>
@@ -356,6 +390,16 @@ function Resumen({invoices,costos}){
   const ultimo=chart.length?chart[chart.length-1]:null;
   const resultado=ultimo?ultimo.Total-costoMensual:0;
 
+  const barData=useMemo(()=>{
+    const win=chart.slice(-barWin);const cnt=win.length||1;const mset=new Set(win.map(r=>r.mk));
+    const rev={TuFud:0,TuShopper:0,Deri:0,Otro:0};
+    invoices.forEach(i=>{if(i.estado==="Anulado"||i.estado==="Neteado")return;const mk=monthKey(i.mes||i.fecha_emision);if(!mset.has(mk))return;const s=SERVICIOS.includes(i.servicio)?i.servicio:"Otro";rev[s]+=usdOf(i);});
+    const cost={};(costos||[]).forEach(c=>{if(c.moneda==="USD")cost[c.servicio]=(cost[c.servicio]||0)+Number(c.monto||0);});
+    const rows=["TuFud","TuShopper","Deri","Otro"].map(s=>({label:s,Ingresos:(rev[s]||0)/cnt,Egresos:cost[s]||0}));
+    if((cost.General||0)>0)rows.push({label:"General",Ingresos:0,Egresos:cost.General});
+    return rows;
+  },[chart,invoices,costos,barWin]);
+
   return <div style={{display:"flex",flexDirection:"column",gap:16}}>
     <div style={{display:"grid",gap:16,gridTemplateColumns:"repeat(auto-fit,minmax(200px,1fr))"}}>
       <Kpi label="Cobrado" val={t.Cobrado} color="var(--ok)"/>
@@ -368,6 +412,19 @@ function Resumen({invoices,costos}){
       <h3 className="font-display" style={{margin:"0 0 4px",fontSize:19}}>Facturación por servicio (USD)</h3>
       <p style={{margin:"0 0 10px",fontSize:12,color:"var(--muted-fg)"}}>Total facturado por mes y por servicio, consolidado en dólares. Tocá la leyenda para mostrar/ocultar líneas.{costoMensual>0?" La línea punteada es tu costo mensual: donde el Total queda por encima, hay ganancia.":""}</p>
       <LineChart data={chart} series={series} fmtY={v=>"US$ "+(Math.abs(v)>=1000?(v/1000).toFixed(0)+"k":Math.round(v))}/>
+    </div>
+
+    <div className="card" style={{padding:20}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:10,marginBottom:8}}>
+        <h3 className="font-display" style={{margin:0,fontSize:19}}>Ingresos vs Egresos por sistema (USD)</h3>
+        <select className="input" style={{width:"auto"}} value={barWin} onChange={e=>setBarWin(Number(e.target.value))}>
+          <option value={6}>Promedio 6 meses</option>
+          <option value={12}>Promedio 12 meses</option>
+          <option value={1}>Último mes</option>
+        </select>
+      </div>
+      <p style={{margin:"0 0 10px",fontSize:12,color:"var(--muted-fg)"}}>Ingreso = facturación mensual promedio de cada sistema en la ventana elegida. Egreso = costo mensual asignado a ese sistema. El número bajo cada sistema es el resultado (ingreso − egreso).</p>
+      <BarChart data={barData} series={[{key:"Ingresos",color:"var(--ok)",label:"Ingresos"},{key:"Egresos",color:"var(--bad)",label:"Egresos"}]} fmtY={v=>"US$ "+(Math.abs(v)>=1000?(v/1000).toFixed(1)+"k":Math.round(v))}/>
     </div>
 
     {costoMensual>0&&ultimo&&<div className="card" style={{padding:20}}>
