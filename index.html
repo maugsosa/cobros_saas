@@ -332,33 +332,36 @@ function LineChart({data,series,height=290,fmtY}){
 }
 
 /* ---------- Gráfica de barras (SVG) ---------- */
-function BarChart({data,series,height=300,fmtY}){
+function BarChart({data,bars,segColors,segLabels,height=300,fmtY}){
   const W=720,H=height,padL=54,padR=14,padT=14,padB=48;
-  const maxV=Math.max(1,...data.flatMap(d=>series.map(s=>d[s.key]||0)));
+  const barTotal=(d,b)=>b.keys.reduce((s,k)=>s+(d[k]||0),0);
+  const maxV=Math.max(1,...data.flatMap(d=>bars.map(b=>barTotal(d,b))));
   const n=data.length||1;
   const groupW=(W-padL-padR)/n;
   const gap=6,innerPad=groupW*0.16;
-  const barW=Math.max(4,(groupW-2*innerPad-(series.length-1)*gap)/series.length);
+  const barW=Math.max(4,(groupW-2*innerPad-(bars.length-1)*gap)/bars.length);
   const y=v=>padT+(H-padT-padB)*(1-v/maxV);
-  const ticks=[0,1,2,3,4].map(i=>maxV*i/4);
   const y0=y(0);
+  const ticks=[0,1,2,3,4].map(i=>maxV*i/4);
+  const legendKeys=[];bars.forEach(b=>b.keys.forEach(k=>{if(!legendKeys.includes(k))legendKeys.push(k);}));
   return <div>
     <svg viewBox={`0 0 ${W} ${H}`} style={{width:"100%",height:"auto"}}>
       {ticks.map((tv,i)=><g key={i}>
         <line x1={padL} x2={W-padR} y1={y(tv)} y2={y(tv)} stroke="var(--grid)"/>
         <text x={padL-6} y={y(tv)+3} textAnchor="end" fontSize="10" fill="var(--muted-fg)">{fmtY?fmtY(tv):Math.round(tv)}</text>
       </g>)}
-      {data.map((d,gi)=>{const gx=padL+gi*groupW+innerPad;const net=(d[series[0].key]||0)-(d[series[1].key]||0);
+      {data.map((d,gi)=>{const gx=padL+gi*groupW+innerPad;const net=barTotal(d,bars[0])-barTotal(d,bars[1]);
         return <g key={gi}>
-          {series.map((s,si)=>{const val=d[s.key]||0;const x=gx+si*(barW+gap);const yy=y(val);
-            return <rect key={si} x={x} y={yy} width={barW} height={Math.max(0,y0-yy)} fill={s.color} rx="3"><title>{`${d.label} · ${s.label}: ${fmtY?fmtY(val):val}`}</title></rect>;})}
+          {bars.map((b,bi)=>{const x=gx+bi*(barW+gap);let acc=0;
+            return b.keys.map((k,ki)=>{const val=d[k]||0;const yTop=y(acc+val);const h=Math.max(0,y(acc)-y(acc+val));acc+=val;
+              return <rect key={ki} x={x} y={yTop} width={barW} height={h} fill={segColors[k]}><title>{`${d.label} · ${segLabels[k]}: ${fmtY?fmtY(val):val}`}</title></rect>;});})}
           <text x={padL+gi*groupW+groupW/2} y={H-28} textAnchor="middle" fontSize="12" fontWeight="600" fill="var(--fg)">{d.label}</text>
           <text x={padL+gi*groupW+groupW/2} y={H-12} textAnchor="middle" fontSize="11" fill={net>=0?"var(--ok)":"var(--bad)"}>{(net>=0?"+":"")+(fmtY?fmtY(net):net)}</text>
         </g>;})}
     </svg>
     <div style={{display:"flex",flexWrap:"wrap",gap:14,marginTop:6}}>
-      {series.map(s=><span key={s.key} style={{display:"inline-flex",alignItems:"center",gap:6,fontSize:13,color:"var(--fg)"}}>
-        <span style={{width:14,height:12,borderRadius:3,background:s.color,display:"inline-block"}}/>{s.label}
+      {legendKeys.map(k=><span key={k} style={{display:"inline-flex",alignItems:"center",gap:6,fontSize:13,color:"var(--fg)"}}>
+        <span style={{width:14,height:12,borderRadius:3,background:segColors[k],display:"inline-block"}}/>{segLabels[k]}
       </span>)}
     </div>
   </div>;
@@ -402,12 +405,12 @@ function Resumen({invoices,costos}){
     const map={avg6:[6,"avg"],avg12:[12,"avg"],acc6:[6,"acc"],acc12:[12,"acc"],last1:[1,"avg"]};
     const [N,mode]=map[barSel]||[6,"avg"];
     const win=chart.slice(-N);const cnt=win.length||1;const mset=new Set(win.map(r=>r.mk));
-    const rev={TuFud:0,TuShopper:0,Deri:0,Scrapper:0,Otro:0};
-    invoices.forEach(i=>{if(i.estado==="Anulado"||i.estado==="Neteado")return;const mk=monthKey(i.mes||i.fecha_emision);if(!mset.has(mk))return;const s=SERVICIOS.includes(i.servicio)?i.servicio:"Otro";rev[s]+=usdOf(i);});
+    const rev={};["TuFud","TuShopper","Deri","Scrapper","Otro"].forEach(s=>rev[s]={Cobrado:0,Pendiente:0});
+    invoices.forEach(i=>{if(i.estado!=="Cobrado"&&i.estado!=="Pendiente")return;const mk=monthKey(i.mes||i.fecha_emision);if(!mset.has(mk))return;const s=SERVICIOS.includes(i.servicio)?i.servicio:"Otro";rev[s][i.estado]+=usdOf(i);});
     const cost={};(costos||[]).forEach(c=>{if(c.moneda==="USD")cost[c.servicio]=(cost[c.servicio]||0)+Number(c.monto||0);});
-    const inFactor=mode==="avg"?(1/cnt):1;const costFactor=mode==="avg"?1:cnt;
-    const rows=["TuFud","TuShopper","Deri","Scrapper","Otro"].map(s=>({label:s,Ingresos:(rev[s]||0)*inFactor,Egresos:(cost[s]||0)*costFactor}));
-    if((cost.General||0)>0)rows.push({label:"General",Ingresos:0,Egresos:cost.General*costFactor});
+    const inF=mode==="avg"?(1/cnt):1;const costF=mode==="avg"?1:cnt;
+    const rows=["TuFud","TuShopper","Deri","Scrapper","Otro"].map(s=>({label:s,Cobrado:rev[s].Cobrado*inF,Pendiente:rev[s].Pendiente*inF,Egresos:(cost[s]||0)*costF}));
+    if((cost.General||0)>0)rows.push({label:"General",Cobrado:0,Pendiente:0,Egresos:cost.General*costF});
     return rows;
   },[chart,invoices,costos,barSel]);
 
@@ -436,8 +439,12 @@ function Resumen({invoices,costos}){
           <option value="last1">Último mes</option>
         </select>
       </div>
-      <p style={{margin:"0 0 10px",fontSize:12,color:"var(--muted-fg)"}}>{barSel.startsWith("acc")?"Ingreso = facturación total del período. Egreso = costo mensual × meses del período. El número bajo cada sistema es el resultado acumulado.":"Ingreso = facturación mensual promedio de cada sistema. Egreso = costo mensual asignado a ese sistema. El número bajo cada sistema es el resultado mensual."}</p>
-      <BarChart data={barData} series={[{key:"Ingresos",color:"var(--ok)",label:"Ingresos"},{key:"Egresos",color:"var(--bad)",label:"Egresos"}]} fmtY={v=>"US$ "+(Math.abs(v)>=1000?(v/1000).toFixed(1)+"k":Math.round(v))}/>
+      <p style={{margin:"0 0 10px",fontSize:12,color:"var(--muted-fg)"}}>{barSel.startsWith("acc")?"Ingreso = facturación total del período (cobrado + por cobrar, apilados). Egreso = costo mensual × meses. El número bajo cada sistema es el resultado acumulado.":"Ingreso = facturación mensual promedio: cobrado (verde) + por cobrar (ámbar), apilados. Egreso = costo mensual del sistema. El número bajo cada sistema es el resultado (no incluye lo perdido)."}</p>
+      <BarChart data={barData}
+        bars={[{label:"Ingresos",keys:["Cobrado","Pendiente"]},{label:"Egresos",keys:["Egresos"]}]}
+        segColors={{Cobrado:"var(--ok)",Pendiente:"var(--warn)",Egresos:"var(--bad)"}}
+        segLabels={{Cobrado:"Cobrado",Pendiente:"Por cobrar",Egresos:"Egresos"}}
+        fmtY={v=>"US$ "+(Math.abs(v)>=1000?(v/1000).toFixed(1)+"k":Math.round(v))}/>
     </div>
 
     {costoMensual>0&&ultimo&&<div className="card" style={{padding:20}}>
