@@ -86,9 +86,9 @@ function _toISO(v){
   m=s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})/);if(m){let[,d,mo,y]=m;if(y.length===2)y="20"+y;return `${y}-${mo.padStart(2,"0")}-${d.padStart(2,"0")}`;}
   return null;
 }
-const _serv=s=>{s=_str(s).toLowerCase();if(!s)return "Otro";if(s.includes("shop"))return "TuShopper";if(s.includes("fud"))return "TuFud";if(s.includes("deri"))return "Deri";return s.charAt(0).toUpperCase()+s.slice(1);};
+const _serv=s=>{s=_str(s).toLowerCase();if(!s)return "Otro";if(s.includes("shop"))return "TuShopper";if(s.includes("fud"))return "TuFud";if(s.includes("deri"))return "Deri";if(s.includes("scrap"))return "Scrapper";return s.charAt(0).toUpperCase()+s.slice(1);};
 const _mon=s=>{s=_str(s).toUpperCase();if(s.includes("DOLAR"))return "USD";if(s.includes("ARGENT"))return "ARS";if(s.includes("URUGUAY"))return "UYU";return CURRENCIES.includes(s)?s:"USD";};
-const _est=s=>{s=_str(s).toUpperCase();if(s==="PAGO")return "Cobrado";if(s.includes("PENDIENTE"))return "Pendiente";if(s.includes("PERDID")||s.includes("INCOBRAB"))return "Perdido";if(s.includes("ANULAD"))return "Anulado";if(s.includes("NETE")||s.includes("CANCEL"))return "Neteado";return "Pendiente";};
+const _est=s=>{s=_str(s).toUpperCase();if(s==="PAGO")return "Cobrado";if(s.includes("PENDIENTE"))return "Pendiente";if(s.includes("PERDID")||s.includes("INCOBRAB"))return "Perdido";if(s.includes("NETE")||s.includes("CANCEL"))return "Neteado";if(s.includes("ANULAD"))return "Perdido";return "Pendiente";};
 const _medio=s=>{const m={santander:"Santander",itau:"Itau",blex:"Blex",dlocal:"Dlocal",cheque:"Cheque",koywe:"Koywe",anulada:""};const l=_str(s).toLowerCase();return l?(m[l]||_str(s).charAt(0).toUpperCase()+_str(s).slice(1)):"";};
 const clave=i=>`${_str(i.cliente).toLowerCase()}|${_str(i.numeracion).toLowerCase()}|${i.mes||""}|${i.total}|${i.moneda}`;
 
@@ -126,12 +126,14 @@ async function fetchAll(){
 }
 async function fetchClaves(){
   let all=[],from=0;
+  const cols="id,clave,estado,servicio,comprobante,importe,iva,fecha_emision,fecha_vencimiento,comentarios,referencia,total_usd,tc";
   while(true){
-    const {data,error}=await sb.from("facturas").select("id,clave,estado,total_usd,tc").range(from,from+999);
+    const {data,error}=await sb.from("facturas").select(cols).range(from,from+999);
     if(error)throw error;all=all.concat(data);if(data.length<1000)break;from+=1000;
   }
   return all;
 }
+const SYNC_FIELDS=["servicio","comprobante","importe","iva","fecha_emision","fecha_vencimiento","comentarios","referencia","total_usd","tc"];
 async function importRows(rows){
   const existing=await fetchClaves();
   const map=new Map(existing.map(r=>[r.clave,r]));
@@ -140,9 +142,12 @@ async function importRows(rows){
     const e=map.get(r.clave);
     if(!e){nuevas.push(r);continue;}
     const patch={};
-    if(r.total_usd!=null&&Number(r.total_usd)!==Number(e.total_usd))patch.total_usd=r.total_usd;
-    if(r.tc!=null&&Number(r.tc)!==Number(e.tc))patch.tc=r.tc;
-    if(e.estado==="Pendiente"&&r.estado!=="Pendiente"){patch.estado=r.estado;patch.medio_pago=r.medio_pago;patch.fecha_pago=r.fecha_pago;}
+    for(const f of SYNC_FIELDS){
+      const nv=r[f]==null?null:r[f], ov=e[f]==null?null:e[f];
+      if(typeof nv==="number"||typeof ov==="number"){if(Number(nv||0)!==Number(ov||0))patch[f]=nv;}
+      else if((nv||"")!==(ov||""))patch[f]=nv;
+    }
+    if(e.estado!=="Cobrado"&&r.estado!=="Pendiente"&&r.estado!==e.estado){patch.estado=r.estado;patch.medio_pago=r.medio_pago;patch.fecha_pago=r.fecha_pago;}
     if(Object.keys(patch).length)updates.push({id:e.id,patch});
   }
   for(let i=0;i<nuevas.length;i+=400){
@@ -289,8 +294,8 @@ function Pendientes({invoices,onMark,clientes,datosCobro}){
 }
 
 /* ---------- Gráfica lineal (SVG) ---------- */
-const SERVICIOS=["TuFud","TuShopper","Deri","Otro"];
-const SERV_COLOR={Total:"#0f5c4a",TuFud:"#3b6cf4",TuShopper:"#0f8a5f",Deri:"#b8791b",Otro:"#9b59b6",Costo:"#c0392b"};
+const SERVICIOS=["TuFud","TuShopper","Deri","Scrapper","Otro"];
+const SERV_COLOR={Total:"#0f5c4a",TuFud:"#3b6cf4",TuShopper:"#0f8a5f",Deri:"#b8791b",Scrapper:"#14a3b8",Otro:"#9b59b6",Costo:"#c0392b"};
 function LineChart({data,series,height=290,fmtY}){
   const [toggled,setToggled]=useState({});
   const isHidden=s=>toggled[s.key]!==undefined?toggled[s.key]:!!s.off;
@@ -372,7 +377,7 @@ function Resumen({invoices,costos}){
   // costos mensuales en USD (los items cargados en USD)
   const costoMensual=useMemo(()=>(costos||[]).filter(c=>c.moneda==="USD").reduce((s,c)=>s+Number(c.monto||0),0),[costos]);
   const costoNoUsd=useMemo(()=>(costos||[]).filter(c=>c.moneda!=="USD").length,[costos]);
-  const costServ=useMemo(()=>{const o={TuFud:0,TuShopper:0,Deri:0,Otro:0};(costos||[]).forEach(c=>{if(c.moneda==="USD"&&o[c.servicio]!=null)o[c.servicio]+=Number(c.monto||0);});return o;},[costos]);
+  const costServ=useMemo(()=>{const o={TuFud:0,TuShopper:0,Deri:0,Scrapper:0,Otro:0};(costos||[]).forEach(c=>{if(c.moneda==="USD"&&o[c.servicio]!=null)o[c.servicio]+=Number(c.monto||0);});return o;},[costos]);
 
   // facturación mensual por servicio en USD (excluye Anuladas y Neteadas)
   const chart=useMemo(()=>{
@@ -381,15 +386,15 @@ function Resumen({invoices,costos}){
       if(i.estado==="Anulado"||i.estado==="Neteado")return;
       const mk=monthKey(i.mes||i.fecha_emision);if(!mk)return;
       const s=SERVICIOS.includes(i.servicio)?i.servicio:"Otro";
-      m[mk]=m[mk]||{mk,Total:0,TuFud:0,TuShopper:0,Deri:0,Otro:0};
+      m[mk]=m[mk]||{mk,Total:0,TuFud:0,TuShopper:0,Deri:0,Scrapper:0,Otro:0};
       const v=usdOf(i);m[mk][s]+=v;m[mk].Total+=v;
     });
-    return Object.values(m).sort((a,b)=>a.mk.localeCompare(b.mk)).map(r=>({...r,label:monthLabel(r.mk),Costo:costoMensual,cTuFud:costServ.TuFud,cTuShopper:costServ.TuShopper,cDeri:costServ.Deri,cOtro:costServ.Otro}));
+    return Object.values(m).sort((a,b)=>a.mk.localeCompare(b.mk)).map(r=>({...r,label:monthLabel(r.mk),Costo:costoMensual,cTuFud:costServ.TuFud,cTuShopper:costServ.TuShopper,cDeri:costServ.Deri,cScrapper:costServ.Scrapper,cOtro:costServ.Otro}));
   },[invoices,costoMensual,costServ]);
 
   const series=[{key:"Total",color:SERV_COLOR.Total,label:"Total"},...SERVICIOS.map(s=>({key:s,color:SERV_COLOR[s],label:s}))];
   if(costoMensual>0)series.push({key:"Costo",color:SERV_COLOR.Costo,label:"Costo total",dash:true});
-  [["cTuFud","TuFud"],["cTuShopper","TuShopper"],["cDeri","Deri"],["cOtro","Otro"]].forEach(([k,s])=>{if(costServ[s]>0)series.push({key:k,color:SERV_COLOR[s],label:"Costo "+s,dash:true,off:true});});
+  [["cTuFud","TuFud"],["cTuShopper","TuShopper"],["cDeri","Deri"],["cScrapper","Scrapper"],["cOtro","Otro"]].forEach(([k,s])=>{if(costServ[s]>0)series.push({key:k,color:SERV_COLOR[s],label:"Costo "+s,dash:true,off:true});});
   const ultimo=chart.length?chart[chart.length-1]:null;
   const resultado=ultimo?ultimo.Total-costoMensual:0;
 
@@ -397,11 +402,11 @@ function Resumen({invoices,costos}){
     const map={avg6:[6,"avg"],avg12:[12,"avg"],acc6:[6,"acc"],acc12:[12,"acc"],last1:[1,"avg"]};
     const [N,mode]=map[barSel]||[6,"avg"];
     const win=chart.slice(-N);const cnt=win.length||1;const mset=new Set(win.map(r=>r.mk));
-    const rev={TuFud:0,TuShopper:0,Deri:0,Otro:0};
+    const rev={TuFud:0,TuShopper:0,Deri:0,Scrapper:0,Otro:0};
     invoices.forEach(i=>{if(i.estado==="Anulado"||i.estado==="Neteado")return;const mk=monthKey(i.mes||i.fecha_emision);if(!mset.has(mk))return;const s=SERVICIOS.includes(i.servicio)?i.servicio:"Otro";rev[s]+=usdOf(i);});
     const cost={};(costos||[]).forEach(c=>{if(c.moneda==="USD")cost[c.servicio]=(cost[c.servicio]||0)+Number(c.monto||0);});
     const inFactor=mode==="avg"?(1/cnt):1;const costFactor=mode==="avg"?1:cnt;
-    const rows=["TuFud","TuShopper","Deri","Otro"].map(s=>({label:s,Ingresos:(rev[s]||0)*inFactor,Egresos:(cost[s]||0)*costFactor}));
+    const rows=["TuFud","TuShopper","Deri","Scrapper","Otro"].map(s=>({label:s,Ingresos:(rev[s]||0)*inFactor,Egresos:(cost[s]||0)*costFactor}));
     if((cost.General||0)>0)rows.push({label:"General",Ingresos:0,Egresos:cost.General*costFactor});
     return rows;
   },[chart,invoices,costos,barSel]);
